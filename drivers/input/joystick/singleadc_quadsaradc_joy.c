@@ -72,6 +72,8 @@ struct joypad {
 	/* report reference point */
 	bool invert_absx;
 	bool invert_absy;
+	bool invert_absrx;
+	bool invert_absry;
 
 	/* report interval (ms) */
 	int bt_gpio_count;
@@ -81,7 +83,7 @@ struct joypad {
 
 	/* report threshold (mV) */
 	int bt_adc_fuzz, bt_adc_flat;
-	int bt_adc_x_range, bt_adc_y_range;
+	int bt_adc_x_range, bt_adc_y_range, bt_adc_rx_range, bt_adc_ry_range;
 	/* adc read value scale */
 	int bt_adc_scale;
 	/* joystick deadzone control */
@@ -99,6 +101,8 @@ struct joypad {
 /*----------------------------------------------------------------------------*/
 static unsigned int g_button_adc_x_range = 0;
 static unsigned int g_button_adc_y_range = 0;
+static unsigned int g_button_adc_rx_range = 0;
+static unsigned int g_button_adc_ry_range = 0;
 static unsigned int g_button_adc_fuzz = 0;
 static unsigned int g_button_adc_flat = 0;
 static unsigned int g_button_adc_scale = 0;
@@ -125,6 +129,28 @@ static int __init button_adcy_range_setup(char *str)
         return 0;
 }
 __setup("button-adc-y-range=", button_adcy_range_setup);
+
+static int __init button_adcrx_range_setup(char *str)
+{
+        if (!str)
+                return -EINVAL;
+
+	g_button_adc_rx_range = simple_strtoul(str, NULL, 10);
+
+        return 0;
+}
+__setup("button-adc-rx-range=", button_adcrx_range_setup);
+
+static int __init button_adcry_range_setup(char *str)
+{
+        if (!str)
+                return -EINVAL;
+
+	g_button_adc_ry_range = simple_strtoul(str, NULL, 10);
+
+        return 0;
+}
+__setup("button-adc-ry-range=", button_adcry_range_setup);
 
 static int button_adc_fuzz(char *str)
 {
@@ -524,9 +550,18 @@ static int joypad_adc_setup(struct device *dev, struct joypad *joypad)
 		enum iio_chan_type type;
 
 		adc->scale = joypad->bt_adc_scale;
-		if (nbtn) {
-			adc->channel =
-				devm_iio_channel_get(dev, "joy_y");
+
+		if (nbtn == 0) {
+			adc->channel = devm_iio_channel_get(dev, "ABS_X");
+			adc->report_type = ABS_X;
+			if (joypad->invert_absx)
+				adc->invert = true;
+
+			adc->max =  (joypad->bt_adc_x_range / 2) - 1;
+			adc->min = -(joypad->bt_adc_x_range / 2);
+		}
+		else if (nbtn == 1) {
+			adc->channel = devm_iio_channel_get(dev, "ABS_Y");
 			adc->report_type = ABS_Y;
 			if (joypad->invert_absy)
 				adc->invert = true;
@@ -534,15 +569,23 @@ static int joypad_adc_setup(struct device *dev, struct joypad *joypad)
 			adc->max =  (joypad->bt_adc_y_range / 2) - 1;
 			adc->min = -(joypad->bt_adc_y_range / 2);
 		}
-		else {
-			adc->channel =
-				devm_iio_channel_get(dev, "joy_x");
-			adc->report_type = ABS_X;
-			if (joypad->invert_absx)
+		else if (nbtn == 2) {
+			adc->channel = devm_iio_channel_get(dev, "ABS_RX");
+			adc->report_type = ABS_RX;
+			if (joypad->invert_absrx)
 				adc->invert = true;
 
-			adc->max =  (joypad->bt_adc_x_range / 2) - 1;
-			adc->min = -(joypad->bt_adc_x_range / 2);
+			adc->max =  (joypad->bt_adc_rx_range / 2) - 1;
+			adc->min = -(joypad->bt_adc_rx_range / 2);
+		}
+		else {
+			adc->channel = devm_iio_channel_get(dev, "ABS_RY");
+			adc->report_type = ABS_RY;
+			if (joypad->invert_absry)
+				adc->invert = true;
+
+			adc->max =  (joypad->bt_adc_ry_range / 2) - 1;
+			adc->min = -(joypad->bt_adc_ry_range / 2);
 		}
 
 		if (IS_ERR(adc->channel)) {
@@ -772,6 +815,16 @@ static void joypad_setup_value_check(struct device *dev, struct joypad *joypad)
 	else
 		device_property_read_u32(dev, "button-adc-y-range",
 					&joypad->bt_adc_y_range);
+	if (g_button_adc_rx_range)
+		joypad->bt_adc_rx_range = g_button_adc_rx_range;
+	else
+		device_property_read_u32(dev, "button-adc-rx-range",
+					&joypad->bt_adc_rx_range);
+	if (g_button_adc_ry_range)
+		joypad->bt_adc_ry_range = g_button_adc_ry_range;
+	else
+		device_property_read_u32(dev, "button-adc-ry-range",
+					&joypad->bt_adc_ry_range);
 }
 
 /*----------------------------------------------------------------------------*/
@@ -793,8 +846,10 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 	/* change the report reference point? (ADC MAX - read value) */
 	joypad->invert_absx = device_property_present(dev, "invert-absx");
 	joypad->invert_absy = device_property_present(dev, "invert-absy");
-	dev_info(dev, "%s : invert-absx = %d, inveret-absy = %d\n",
-		__func__, joypad->invert_absx, joypad->invert_absy);
+	joypad->invert_absrx = device_property_present(dev, "invert-absrx");
+	joypad->invert_absry = device_property_present(dev, "invert-absry");
+	dev_info(dev, "%s : invert-absx = %d, inveret-absy = %d\n, inveret-absrx = %d\n, inveret-absry = %d\n",
+		__func__, joypad->invert_absx, joypad->invert_absy, joypad->invert_absrx, joypad->invert_absry);
 
 	joypad->bt_gpio_count = device_get_child_node_count(dev);
 
