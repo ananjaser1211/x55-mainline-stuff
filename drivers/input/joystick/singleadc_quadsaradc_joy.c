@@ -5,7 +5,7 @@
  */
 
 /*
- * Single SARADC dual-joystick gamepad driver
+ * Quad SARADC dual-joystick gamepad driver
  */
 
 /*----------------------------------------------------------------------------*/
@@ -27,16 +27,14 @@
 
 /*----------------------------------------------------------------------------*/
 #define DRV_NAME "retrogame_joypad"
-#define __LEFT_JOYSTICK_INVERT__
 #define __MURMUR__
 /*----------------------------------------------------------------------------*/
-#define	ADC_MAX_VOLTAGE		1800
-#define	ADC_DATA_TUNING(x, p)	((x * p) / 100)
-#define	ADC_TUNING_DEFAULT	180
 
 struct bt_adc {
+	/* IIO ADC Channel */
+	struct iio_channel *channel;
 	/* report value (mV) */
-	int value;
+	int old_value;
 	/* report type */
 	int report_type;
 	/* input device init value (mV) */
@@ -47,19 +45,6 @@ struct bt_adc {
 	int scale;
 	/* invert report */
 	bool invert;
-	/* amux channel */
-	int amux_ch;
-	/* adc data tuning value([percent), p = positive, n = negative */
-	int tuning_p, tuning_n;
-};
-
-struct analog_mux {
-	/* IIO ADC Channel : amux connect channel */
-	struct iio_channel *iio_ch;
-	/* analog mux select(a,b) gpio */
-	int sel_a_gpio, sel_b_gpio;
-	/* analog mux enable gpio */
-	int en_gpio;
 };
 
 struct bt_gpio {
@@ -84,31 +69,27 @@ struct joypad {
 	/* report enable/disable */
 	bool enable;
 
-	/* analog mux & joystick control */
-	struct analog_mux *amux;
-	/* analog mux max count */
-	int amux_count;
-	/* analog button */
-	struct bt_adc *adcs;
+	/* report reference point */
+	bool invert_absx;
+	bool invert_absy;
 
 	/* report interval (ms) */
 	int bt_gpio_count;
 	struct bt_gpio *gpios;
-
 	/* button auto repeat */
 	int auto_repeat;
 
 	/* report threshold (mV) */
 	int bt_adc_fuzz, bt_adc_flat;
+	int bt_adc_x_range, bt_adc_y_range;
 	/* adc read value scale */
 	int bt_adc_scale;
 	/* joystick deadzone control */
 	int bt_adc_deadzone;
+	int bt_adc_count;
+	struct bt_adc *adcs;
 
 	struct mutex lock;
-
-	/* amux debug channel */
-	int debug_ch;
 };
 
 /*----------------------------------------------------------------------------*/
@@ -116,10 +97,34 @@ struct joypad {
 // set to the value in the boot.ini file. (if exist)
 //
 /*----------------------------------------------------------------------------*/
+static unsigned int g_button_adc_x_range = 0;
+static unsigned int g_button_adc_y_range = 0;
 static unsigned int g_button_adc_fuzz = 0;
 static unsigned int g_button_adc_flat = 0;
 static unsigned int g_button_adc_scale = 0;
 static unsigned int g_button_adc_deadzone = 0;
+
+static int __init button_adcx_range_setup(char *str)
+{
+        if (!str)
+                return -EINVAL;
+
+	g_button_adc_x_range = simple_strtoul(str, NULL, 10);
+
+        return 0;
+}
+__setup("button-adc-x-range=", button_adcx_range_setup);
+
+static int __init button_adcy_range_setup(char *str)
+{
+        if (!str)
+                return -EINVAL;
+
+	g_button_adc_y_range = simple_strtoul(str, NULL, 10);
+
+        return 0;
+}
+__setup("button-adc-y-range=", button_adcy_range_setup);
 
 static int button_adc_fuzz(char *str)
 {
@@ -159,55 +164,16 @@ __setup("button-adc-deadzone=", button_adc_deadzone);
 
 /*----------------------------------------------------------------------------*/
 /*----------------------------------------------------------------------------*/
-static int joypad_amux_select(struct analog_mux *amux, int channel)
-{
-	/* select mux channel */
-	gpio_set_value(amux->en_gpio, 0);
-
-	switch(channel) {
-		case 0:	/* EVENT (ABS_RY) */
-			gpio_set_value(amux->sel_a_gpio, 0);
-			gpio_set_value(amux->sel_b_gpio, 0);
-			break;
-		case 1:	/* EVENT (ABS_RX) */
-			gpio_set_value(amux->sel_a_gpio, 0);
-			gpio_set_value(amux->sel_b_gpio, 1);
-			break;
-		case 2:	/* EVENT (ABS_Y) */
-			gpio_set_value(amux->sel_a_gpio, 1);
-			gpio_set_value(amux->sel_b_gpio, 0);
-			break;
-		case 3:	/* EVENT (ABS_X) */
-			gpio_set_value(amux->sel_a_gpio, 1);
-			gpio_set_value(amux->sel_b_gpio, 1);
-			break;
-		default:
-			/* amux disanle */
-			gpio_set_value(amux->en_gpio, 1);
-			return -1;
-	}
-	/* mux swtiching speed : 35ns(on) / 9ns(off) */
-	usleep_range(10, 20);
-	return 0;
-}
-
-/*----------------------------------------------------------------------------*/
-static int joypad_adc_read(struct analog_mux *amux, struct bt_adc *adc)
+static int joypad_adc_read(struct bt_adc *adc)
 {
 	int value;
 
-
-	if (joypad_amux_select(amux, adc->amux_ch))
+	if (iio_read_channel_processed(adc->channel, &value))
 		return 0;
 
-	iio_read_channel_raw(amux->iio_ch, &value);
-
 	value *= adc->scale;
-#ifdef __LEFT_JOYSTICK_INVERT__
-	return value;
-#else
+
 	return (adc->invert ? (adc->max - value) : value);
-#endif
 }
 
 /*----------------------------------------------------------------------------*/
@@ -353,16 +319,16 @@ static ssize_t joypad_store_adc_cal(struct device *dev,
 		int nbtn;
 
 		mutex_lock(&joypad->lock);
-		for (nbtn = 0; nbtn < joypad->amux_count; nbtn++) {
+		for (nbtn = 0; nbtn < joypad->bt_adc_count; nbtn++) {
 			struct bt_adc *adc = &joypad->adcs[nbtn];
 
-			adc->value = joypad_adc_read(joypad->amux, adc);
-			if (!adc->value) {
+			adc->cal = joypad_adc_read(adc);
+			if (!adc->cal) {
 				dev_err(joypad->dev, "%s : saradc channels[%d]!\n",
 					__func__, nbtn);
 				continue;
 			}
-			adc->cal = adc->value;
+			adc->old_value = adc->cal;
 		}
 		mutex_unlock(&joypad->lock);
 	}
@@ -379,12 +345,12 @@ static ssize_t joypad_show_adc_cal(struct device *dev,
 	int nbtn;
 	ssize_t pos;
 
-	for (nbtn = 0, pos = 0; nbtn < joypad->amux_count; nbtn++) {
+	for (nbtn = 0, pos = 0; nbtn < joypad->bt_adc_count; nbtn++) {
 		struct bt_adc *adc = &joypad->adcs[nbtn];
-		pos += sprintf(&buf[pos], "adc[%d]->cal = %d\n",
+		pos += sprintf(&buf[pos], "adc[%d]->cal = %d ",
 				nbtn, adc->cal);
 	}
-	pos += sprintf(&buf[pos], "adc scale = %d\n", joypad->bt_adc_scale);
+	pos += sprintf(&buf[pos], "\n");
 	return pos;
 }
 
@@ -394,73 +360,6 @@ static DEVICE_ATTR(adc_cal, S_IWUSR | S_IRUGO,
 		   joypad_store_adc_cal);
 
 /*----------------------------------------------------------------------------*/
-/*
- * ATTRIBUTES:
- *
- * /sys/devices/platform/retrogame_joypad/amux_debug [rw]
- *
- * echo [debug channel] > amux_debug
- * cat amux_debug : debug channel mux set & adc read
- */
-/*----------------------------------------------------------------------------*/
-static ssize_t joypad_store_amux_debug(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf,
-				      size_t count)
-{
-	struct platform_device *pdev  = to_platform_device(dev);
-	struct joypad *joypad = platform_get_drvdata(pdev);
-
-	joypad->debug_ch = simple_strtoul(buf, NULL, 10);
-
-	/* if error than default setting(debug_ch = 0) */
-	if (joypad->debug_ch > joypad->amux_count)
-		joypad->debug_ch = 0;
-
-	return count;
-}
-
-/*----------------------------------------------------------------------------*/
-static ssize_t joypad_show_amux_debug(struct device *dev,
-				     struct device_attribute *attr,
-				     char *buf)
-{
-	struct platform_device *pdev  = to_platform_device(dev);
-	struct joypad *joypad = platform_get_drvdata(pdev);
-	struct analog_mux *amux = joypad->amux;
-	ssize_t pos;
-	int value;
-
-	mutex_lock(&joypad->lock);
-
-	/* disable poll driver */
-	if (joypad->enable)
-		joypad->enable = false;
-
-	if (joypad_amux_select(amux, joypad->debug_ch))
-		goto err_out;
-
-	if (iio_read_channel_processed(amux->iio_ch, &value))
-		goto err_out;
-
-	pos = sprintf(buf, "amux ch[%d], adc scale = %d, adc value = %d\n",
-			joypad->debug_ch, joypad->bt_adc_scale,
-			value * joypad->bt_adc_scale);
-	goto out;
-
-err_out:
-	pos = sprintf(buf, "error : amux setup & adc read!\n");
-out:
-	mutex_unlock(&joypad->lock);
-	return pos;
-}
-
-/*----------------------------------------------------------------------------*/
-static DEVICE_ATTR(amux_debug, S_IWUSR | S_IRUGO,
-		   joypad_show_amux_debug,
-		   joypad_store_amux_debug);
-
-/*----------------------------------------------------------------------------*/
 /*----------------------------------------------------------------------------*/
 static struct attribute *joypad_attrs[] = {
 	&dev_attr_poll_interval.attr,
@@ -468,7 +367,6 @@ static struct attribute *joypad_attrs[] = {
 	&dev_attr_adc_flat.attr,
 	&dev_attr_enable.attr,
 	&dev_attr_adc_cal.attr,
-	&dev_attr_amux_debug.attr,
 	NULL,
 };
 
@@ -506,36 +404,40 @@ static void joypad_gpio_check(struct input_polled_dev *poll_dev)
 static void joypad_adc_check(struct input_polled_dev *poll_dev)
 {
 	struct joypad *joypad = poll_dev->private;
-	int nbtn;
+	int nbtn, value;
 
-	for (nbtn = 0; nbtn < joypad->amux_count; nbtn++) {
+	for (nbtn = 0; nbtn < joypad->bt_adc_count; nbtn++) {
 		struct bt_adc *adc = &joypad->adcs[nbtn];
 
-		adc->value = joypad_adc_read(joypad->amux, adc);
-		if (!adc->value) {
-			//dev_err(joypad->dev, "%s : saradc channels[%d]! adc->value : %d\n",__func__, nbtn, adc->value);
+		value = joypad_adc_read(adc);
+		if (!value) {
+			dev_err(joypad->dev, "%s : saradc channels[%d]!\n",
+				__func__, nbtn);
 			continue;
 		}
-		adc->value = adc->value - adc->cal;
 
 		/* Joystick Deadzone check */
 		if (joypad->bt_adc_deadzone) {
-			if (abs(adc->value) < joypad->bt_adc_deadzone)
-				adc->value = 0;
+			if ((value < adc->cal + joypad->bt_adc_deadzone) &&
+			    (value > adc->cal - joypad->bt_adc_deadzone))
+				value = adc->cal;
 		}
+		value = value - adc->cal;
+		value = value > adc->max ? adc->max : value;
+		value = value < adc->min ? adc->min : value;
 
-		/* adc data tuning */
-		if (adc->tuning_n && adc->value < 0)
-			adc->value = ADC_DATA_TUNING(adc->value, adc->tuning_n);
-		if (adc->tuning_p && adc->value > 0)
-			adc->value = ADC_DATA_TUNING(adc->value, adc->tuning_p);
-
-		adc->value = adc->value > adc->max ? adc->max : adc->value;
-		adc->value = adc->value < adc->min ? adc->min : adc->value;
-
-		input_report_abs(poll_dev->input,
-			adc->report_type,
-			adc->invert ? adc->value * (-1) : adc->value);
+		if (nbtn == 0)
+		{
+			// adc-x value is default inverted(h/w)
+			input_report_abs(poll_dev->input,
+				adc->report_type, value * (-1));
+		}
+		else
+		{
+			input_report_abs(poll_dev->input,
+				adc->report_type, value);
+		}
+		adc->old_value = value;
 	}
 	input_sync(poll_dev->input);
 }
@@ -566,16 +468,16 @@ static void joypad_open(struct input_polled_dev *poll_dev)
 		struct bt_gpio *gpio = &joypad->gpios[nbtn];
 		gpio->old_value = gpio->active_level ? 0 : 1;
 	}
-	for (nbtn = 0; nbtn < joypad->amux_count; nbtn++) {
+	for (nbtn = 0; nbtn < joypad->bt_adc_count; nbtn++) {
 		struct bt_adc *adc = &joypad->adcs[nbtn];
 
-		adc->value = joypad_adc_read(joypad->amux, adc);
-		if (!adc->value) {
+		adc->old_value = joypad_adc_read(adc);
+		if (!adc->old_value) {
 			dev_err(joypad->dev, "%s : saradc channels[%d]!\n",
 				__func__, nbtn);
 			continue;
 		}
-		adc->cal = adc->value;
+		adc->cal = adc->old_value;
 		dev_info(joypad->dev, "%s : adc[%d] adc->cal = %d\n",
 			__func__, nbtn, adc->cal);
 	}
@@ -605,169 +507,63 @@ static void joypad_close(struct input_polled_dev *poll_dev)
 }
 
 /*----------------------------------------------------------------------------*/
-static int joypad_amux_setup(struct device *dev, struct joypad *joypad)
-{
-	struct analog_mux *amux;
-	enum iio_chan_type type;
-	enum of_gpio_flags flags;
-	int ret;
-
-	/* analog mux control struct init */
-	joypad->amux = devm_kzalloc(dev, sizeof(struct analog_mux),
-					GFP_KERNEL);
-	if (!joypad->amux) {
-		dev_err(dev, "%s amux devm_kzmalloc error!", __func__);
-		return -ENOMEM;
-	}
-	amux = joypad->amux;
-	amux->iio_ch = devm_iio_channel_get(dev, "amux_adc");
-	if (PTR_ERR(amux->iio_ch) == -EPROBE_DEFER)
-		return -EPROBE_DEFER;
-	if (IS_ERR(amux->iio_ch)) {
-		dev_err(dev, "iio channel get error\n");
-		return -EINVAL;
-	}
-	if (!amux->iio_ch->indio_dev)
-		return -ENXIO;
-
-	if (iio_get_channel_type(amux->iio_ch, &type))
-		return -EINVAL;
-
-	if (type != IIO_VOLTAGE) {
-		dev_err(dev, "Incompatible channel type %d\n", type);
-		return -EINVAL;
-	}
-
-	amux->sel_a_gpio = of_get_named_gpio_flags(dev->of_node,
-				"amux-a-gpios", 0, &flags);
-	if (gpio_is_valid(amux->sel_a_gpio)) {
-		ret = devm_gpio_request(dev, amux->sel_a_gpio, "amux-sel-a");
-		if (ret < 0) {
-			dev_err(dev, "%s : failed to request amux-sel-a %d\n",
-				__func__, amux->sel_a_gpio);
-			goto err_out;
-		}
-		ret = gpio_direction_output(amux->sel_a_gpio, 0);
-		if (ret < 0)
-			goto err_out;
-	}
-
-	amux->sel_b_gpio = of_get_named_gpio_flags(dev->of_node,
-				"amux-b-gpios", 0, &flags);
-	if (gpio_is_valid(amux->sel_b_gpio)) {
-		ret = devm_gpio_request(dev, amux->sel_b_gpio, "amux-sel-b");
-		if (ret < 0) {
-			dev_err(dev, "%s : failed to request amux-sel-b %d\n",
-				__func__, amux->sel_b_gpio);
-			goto err_out;
-		}
-		ret = gpio_direction_output(amux->sel_b_gpio, 0);
-		if (ret < 0)
-			goto err_out;
-	}
-
-	amux->en_gpio = of_get_named_gpio_flags(dev->of_node,
-				"amux-en-gpios", 0, &flags);
-	if (gpio_is_valid(amux->en_gpio)) {
-		ret = devm_gpio_request(dev, amux->en_gpio, "amux-en");
-		if (ret < 0) {
-			dev_err(dev, "%s : failed to request amux-en %d\n",
-				__func__, amux->en_gpio);
-			goto err_out;
-		}
-		ret = gpio_direction_output(amux->en_gpio, 0);
-		if (ret < 0)
-			goto err_out;
-	}
-	return	0;
-err_out:
-	return ret;
-}
-
-/*----------------------------------------------------------------------------*/
 static int joypad_adc_setup(struct device *dev, struct joypad *joypad)
 {
-	int nbtn;
+	int nbtn = 0;
 
-	/* adc button struct init */
-	joypad->adcs = devm_kzalloc(dev, joypad->amux_count *
+	joypad->adcs = devm_kzalloc(dev, joypad->bt_adc_count *
 				sizeof(struct bt_adc), GFP_KERNEL);
+
 	if (!joypad->adcs) {
 		dev_err(dev, "%s devm_kzmalloc error!", __func__);
 		return -ENOMEM;
 	}
 
-	for (nbtn = 0; nbtn < joypad->amux_count; nbtn++) {
+	for (nbtn = 0; nbtn < joypad->bt_adc_count; nbtn++) {
 		struct bt_adc *adc = &joypad->adcs[nbtn];
+		enum iio_chan_type type;
 
 		adc->scale = joypad->bt_adc_scale;
-		
-		adc->max = (ADC_MAX_VOLTAGE / 2);
-		adc->min = (ADC_MAX_VOLTAGE / 2) * (-1);
-		if (adc->scale) {
-			adc->max *= adc->scale;
-			adc->min *= adc->scale;
-		}
-		adc->amux_ch = nbtn;
-		adc->invert = false;
+		if (nbtn) {
+			adc->channel =
+				devm_iio_channel_get(dev, "joy_y");
+			adc->report_type = ABS_Y;
+			if (joypad->invert_absy)
+				adc->invert = true;
 
-		switch (nbtn) {
-			case 0:
-				adc->report_type = ABS_RY;
-				if (device_property_read_u32(dev,
-					"abs_ry-p-tuning",
-					&adc->tuning_p))
-					adc->tuning_p = ADC_TUNING_DEFAULT;
-				if (device_property_read_u32(dev,
-					"abs_ry-n-tuning",
-					&adc->tuning_n))
-					adc->tuning_n = ADC_TUNING_DEFAULT;
-				break;
-			case 1:
-				adc->report_type = ABS_RX;
-				if (device_property_read_u32(dev,
-					"abs_rx-p-tuning",
-					&adc->tuning_p))
-					adc->tuning_p = ADC_TUNING_DEFAULT;
-				if (device_property_read_u32(dev,
-					"abs_rx-n-tuning",
-					&adc->tuning_n))
-					adc->tuning_n = ADC_TUNING_DEFAULT;
-				break;
-			case 2:
-			#ifdef __LEFT_JOYSTICK_INVERT__
-				adc->invert = true;	
-			#endif
-				adc->report_type = ABS_Y;
-				if (device_property_read_u32(dev,
-					"abs_y-p-tuning",
-					&adc->tuning_p))
-					adc->tuning_p = ADC_TUNING_DEFAULT;
-				if (device_property_read_u32(dev,
-					"abs_y-n-tuning",
-					&adc->tuning_n))
-					adc->tuning_n = ADC_TUNING_DEFAULT;
-				break;
-			case 3:
-			#ifdef __LEFT_JOYSTICK_INVERT__
-				adc->invert = true;	
-			#endif
-				adc->report_type = ABS_X;
-				if (device_property_read_u32(dev,
-					"abs_x-p-tuning",
-					&adc->tuning_p))
-					adc->tuning_p = ADC_TUNING_DEFAULT;
-				if (device_property_read_u32(dev,
-					"abs_x-n-tuning",
-					&adc->tuning_n))
-					adc->tuning_n = ADC_TUNING_DEFAULT;
-				break;
-			default :
-				dev_err(dev, "%s amux count(%d) error!",
-					__func__, nbtn);
-				return -EINVAL;
+			adc->max =  (joypad->bt_adc_y_range / 2) - 1;
+			adc->min = -(joypad->bt_adc_y_range / 2);
+		}
+		else {
+			adc->channel =
+				devm_iio_channel_get(dev, "joy_x");
+			adc->report_type = ABS_X;
+			if (joypad->invert_absx)
+				adc->invert = true;
+
+			adc->max =  (joypad->bt_adc_x_range / 2) - 1;
+			adc->min = -(joypad->bt_adc_x_range / 2);
+		}
+
+		if (IS_ERR(adc->channel)) {
+			dev_err(dev, "iio channel[%d] get error\n", nbtn);
+			return -EINVAL;
+		}
+		if (!adc->channel->indio_dev)
+			return -ENXIO;
+
+		if (iio_get_channel_type(adc->channel, &type))
+			return -EINVAL;
+
+		if (type != IIO_VOLTAGE) {
+			dev_err(dev, "Incompatible channel %d type %d\n",
+				nbtn, type);
+			return -EINVAL;
 		}
 	}
+	if (nbtn == 0)
+		return -EINVAL;
+
 	return	0;
 }
 
@@ -894,7 +690,7 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 
 	/* IIO ADC key setup (0 mv ~ 1800 mv) * adc->scale */
 	__set_bit(EV_ABS, input->evbit);
-	for(nbtn = 0; nbtn < joypad->amux_count; nbtn++) {
+	for(nbtn = 0; nbtn < joypad->bt_adc_count; nbtn++) {
 		struct bt_adc *adc = &joypad->adcs[nbtn];
 		input_set_abs_params(input, adc->report_type,
 				adc->min, adc->max,
@@ -906,9 +702,6 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 			__func__, adc->scale, adc->min, adc->max,
 			joypad->bt_adc_fuzz, joypad->bt_adc_flat,
 			joypad->bt_adc_deadzone);
-		dev_info(dev,
-			"%s : adc tuning_p = %d, adc_tuning_n = %d\n\n",
-			__func__, adc->tuning_p, adc->tuning_n);
 	}
 
 	/* GPIO key setup */
@@ -969,6 +762,16 @@ static void joypad_setup_value_check(struct device *dev, struct joypad *joypad)
 		device_property_read_u32(dev, "button-adc-deadzone",
 					&joypad->bt_adc_deadzone);
 
+	if (g_button_adc_x_range)
+		joypad->bt_adc_x_range = g_button_adc_x_range;
+	else
+		device_property_read_u32(dev, "button-adc-x-range",
+					&joypad->bt_adc_x_range);
+	if (g_button_adc_y_range)
+		joypad->bt_adc_y_range = g_button_adc_y_range;
+	else
+		device_property_read_u32(dev, "button-adc-y-range",
+					&joypad->bt_adc_y_range);
 }
 
 /*----------------------------------------------------------------------------*/
@@ -979,19 +782,25 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 	/* initialize value check from boot.ini */
 	joypad_setup_value_check(dev, joypad);
 
-	device_property_read_u32(dev, "amux-count",
-				&joypad->amux_count);
+	device_property_read_u32(dev, "button-adc-count",
+				&joypad->bt_adc_count);
 
 	device_property_read_u32(dev, "poll-interval",
 				&joypad->poll_interval);
 
 	joypad->auto_repeat = device_property_present(dev, "autorepeat");
 
+	/* change the report reference point? (ADC MAX - read value) */
+	joypad->invert_absx = device_property_present(dev, "invert-absx");
+	joypad->invert_absy = device_property_present(dev, "invert-absy");
+	dev_info(dev, "%s : invert-absx = %d, inveret-absy = %d\n",
+		__func__, joypad->invert_absx, joypad->invert_absy);
+
 	joypad->bt_gpio_count = device_get_child_node_count(dev);
 
-	if ((joypad->amux_count == 0) || (joypad->bt_gpio_count == 0)) {
+	if ((joypad->bt_adc_count == 0) || (joypad->bt_gpio_count == 0)) {
 		dev_err(dev, "adc key = %d, gpio key = %d error!",
-			joypad->amux_count, joypad->bt_gpio_count);
+			joypad->bt_adc_count, joypad->bt_gpio_count);
 		return -EINVAL;
 	}
 
@@ -999,16 +808,9 @@ static int joypad_dt_parse(struct device *dev, struct joypad *joypad)
 	if (error)
 		return error;
 
-	error = joypad_amux_setup(dev, joypad);
-	if (error)
-		return error;
-
 	error = joypad_gpio_setup(dev, joypad);
 	if (error)
 		return error;
-
-	dev_info(dev, "%s : adc key cnt = %d, gpio key cnt = %d\n",
-			__func__, joypad->amux_count, joypad->bt_gpio_count);
 
 	return error;
 }
