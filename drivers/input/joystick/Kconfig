@@ -398,6 +398,11 @@ config JOYSTICK_SINGLEADCJOY
 	help
 	  The 1-in 4-out SARADC joypad driver.
 
+config JOYSTICK_SINGLEADC_QUADSAR_JOY
+	tristate "Quad SARADC dual-joystick gamepad driver"
+	help
+	  The 1-in 4-out SARADC joypad driver.
+
 config JOYSTICK_N64
 	bool "N64 controller"
 	depends on MACH_NINTENDO64
