@@ -904,7 +904,7 @@ static int joypad_probe(struct platform_device *pdev)
 
 /*----------------------------------------------------------------------------*/
 static const struct of_device_id joypad_of_match[] = {
-	{ .compatible = "singleadc-joypad", },
+	{ .compatible = "singleadc-joypad-x55", },
 	{},
 };
 
