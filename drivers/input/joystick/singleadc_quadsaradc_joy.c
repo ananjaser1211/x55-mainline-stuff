@@ -665,29 +665,29 @@ static int joypad_gpio_setup(struct device *dev, struct joypad *joypad)
 }
 
 /*----------------------------------------------------------------------------*/
-struct input_dev * joypad_input_g;
+struct input_dev * joypad_input_g_x55;
 
 
-void rk_send_key_f_key_up(void)
+void rk_send_key_f_key_up_x55(void)
 {
-	if (!joypad_input_g)
+	if (!joypad_input_g_x55)
 		return;
 
-	input_report_key(joypad_input_g, BTN_MODE, 1);
-	input_sync(joypad_input_g);
+	input_report_key(joypad_input_g_x55, BTN_MODE, 1);
+	input_sync(joypad_input_g_x55);
 }
-EXPORT_SYMBOL(rk_send_key_f_key_up);
+EXPORT_SYMBOL(rk_send_key_f_key_up_x55);
 
 
-void rk_send_key_f_key_down(void)
+void rk_send_key_f_key_down_x55(void)
 {
-	if (!joypad_input_g)
+	if (!joypad_input_g_x55)
 		return;
 
-	input_report_key(joypad_input_g, BTN_MODE, 0);
-	input_sync(joypad_input_g);
+	input_report_key(joypad_input_g_x55, BTN_MODE, 0);
+	input_sync(joypad_input_g_x55);
 }
-EXPORT_SYMBOL(rk_send_key_f_key_down);
+EXPORT_SYMBOL(rk_send_key_f_key_down_x55);
 
 
 static int joypad_input_setup(struct device *dev, struct joypad *joypad)
@@ -711,7 +711,7 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 	poll_dev->close		= joypad_close;
 
 	input = poll_dev->input;
-	joypad_input_g=input;
+	joypad_input_g_x55=input;
 
 	device_property_read_string(dev, "joypad-name", &input->name);
 	input->phys = DRV_NAME"/input0";
