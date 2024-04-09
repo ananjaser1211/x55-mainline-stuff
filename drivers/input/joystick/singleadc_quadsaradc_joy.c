@@ -26,7 +26,7 @@
 #include <linux/delay.h>
 
 /*----------------------------------------------------------------------------*/
-#define DRV_NAME "retrogame_joypad"
+#define DRV_NAME "retrogame_joypad_x55"
 #define __MURMUR__
 /*----------------------------------------------------------------------------*/
 
